@@ -1,0 +1,21 @@
+{
+    "name": "Development Container",
+    "build": {
+        "context": "..",
+        "dockerfile": "${localWorkspaceFolder}/.devcontainer/Dockerfile"
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "ms-python.black-formatter",
+                "anthropic.claude-code"
+            ]
+        }
+    },
+    "runArgs": [
+        "--network=host",
+        "--gpus=all"
+    ]
+}
