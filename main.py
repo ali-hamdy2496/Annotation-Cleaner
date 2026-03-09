@@ -10,6 +10,7 @@ This script:
 
 import numpy as np
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon as MplPolygon, Patch
 from shapely.geometry import Polygon as ShapelyPolygon
@@ -280,12 +281,13 @@ def combine_region_results(all_results, all_x0s, movables_per_region, original_m
 def verify_overlaps_shapely(result, movables, fixed_obstacles, min_separation=0.0):
     """
     Verify overlaps using Shapely (ground truth verification).
+    Uses STRtree spatial indexing for O(n log n) instead of O(n²).
     """
-    n = len(movables)
+    from shapely.strtree import STRtree
     pts = result.reshape(-1, 2)
     overlaps = []
-    
-    # Get movable polygons
+
+    # Build movable polygons
     mov_polys = []
     for i, mov in enumerate(movables):
         verts = translate_polygon(mov["verts"], pts[i], mov.get("RotationAngle", 0.0))
@@ -297,9 +299,10 @@ def verify_overlaps_shapely(result, movables, fixed_obstacles, min_separation=0.
             mov_polys.append(poly)
         except:
             mov_polys.append(None)
-    
-    # Get fixed obstacle polygons
-    fixed_polys = []
+
+    # Build fixed obstacle polygons
+    fixed_polys = []      # (obs_dict, poly)
+    fixed_polys_only = [] # just the polys for STRtree
     for obs in fixed_obstacles:
         if obs.get("center") is None:
             continue
@@ -310,32 +313,40 @@ def verify_overlaps_shapely(result, movables, fixed_obstacles, min_separation=0.
             if not poly.is_valid:
                 poly = poly.buffer(0)
             fixed_polys.append((obs, poly))
+            fixed_polys_only.append(poly)
         except:
             continue
-    
-    # Check movable-movable overlaps
-    for i in range(n):
-        if mov_polys[i] is None:
-            continue
-        for j in range(i + 1, n):
-            if mov_polys[j] is None:
-                continue
-            
-            if mov_polys[i].intersects(mov_polys[j]):
-                intersection = mov_polys[i].intersection(mov_polys[j])
-                if hasattr(intersection, 'area') and intersection.area > 1e-6:
-                    overlaps.append(("mov-mov", i, j, intersection.area))
-    
-    # Check movable-fixed overlaps
-    for i in range(n):
-        if mov_polys[i] is None:
-            continue
-        for obs, obs_poly in fixed_polys:
-            if mov_polys[i].intersects(obs_poly):
-                intersection = mov_polys[i].intersection(obs_poly)
-                if hasattr(intersection, 'area') and intersection.area > 1e-6:
-                    overlaps.append(("mov-fix", i, obs.get("ElementId", "?"), intersection.area))
-    
+
+    # --- mov-mov overlaps via STRtree ---
+    valid_mov = [(i, p) for i, p in enumerate(mov_polys) if p is not None]
+    if valid_mov:
+        valid_indices, valid_polys = zip(*valid_mov)
+        valid_indices = list(valid_indices)
+        valid_polys = list(valid_polys)
+        mov_tree = STRtree(valid_polys)
+        # query returns (input_idx, tree_idx) pairs where bboxes overlap
+        pairs_l, pairs_r = mov_tree.query(valid_polys, predicate="intersects")
+        for k in range(len(pairs_l)):
+            li, ri = int(pairs_l[k]), int(pairs_r[k])
+            oi, oj = valid_indices[li], valid_indices[ri]
+            if oi >= oj:
+                continue  # deduplicate: only keep i < j
+            ix = mov_polys[oi].intersection(mov_polys[oj])
+            if hasattr(ix, 'area') and ix.area > 1e-6:
+                overlaps.append(("mov-mov", oi, oj, ix.area))
+
+    # --- mov-fix overlaps via STRtree ---
+    if fixed_polys_only and valid_mov:
+        fix_tree = STRtree(fixed_polys_only)
+        pairs_l, pairs_r = fix_tree.query(valid_polys, predicate="intersects")
+        for k in range(len(pairs_l)):
+            mi = valid_indices[int(pairs_l[k])]
+            fi = int(pairs_r[k])
+            obs, obs_poly = fixed_polys[fi]
+            ix = mov_polys[mi].intersection(obs_poly)
+            if hasattr(ix, 'area') and ix.area > 1e-6:
+                overlaps.append(("mov-fix", mi, obs.get("ElementId", "?"), ix.area))
+
     return overlaps
 
 
@@ -441,38 +452,70 @@ def main():
     print("=" * 80)
     
     total_adjusted = 0
-    for region_idx, (movs, region_info) in enumerate(zip(movables_per_region, regions_info)):
-        if len(movs) == 0:
-            continue
-        
-        region_poly = region_info.get("shapely_polygon")
-        if region_poly is None:
-            continue
-        
-        adjusted = pull_movables_into_region(movs, region_poly, min_margin=0.1)
-        if adjusted > 0:
-            print(f"  Region {region_idx}: Pulled {adjusted} movables inside")
-            total_adjusted += adjusted
-    
+
+    def pull_region(args):
+        region_idx, movs, region_info = args
+        if len(movs) == 0 or region_info.get("shapely_polygon") is None:
+            return region_idx, 0
+        adjusted = pull_movables_into_region(movs, region_info["shapely_polygon"], min_margin=0.1)
+        return region_idx, adjusted
+
+    with ThreadPoolExecutor() as executor:
+        futures = {
+            executor.submit(pull_region, (i, movs, region_info)): i
+            for i, (movs, region_info) in enumerate(zip(movables_per_region, regions_info))
+        }
+        for future in as_completed(futures):
+            region_idx, adjusted = future.result()
+            if adjusted > 0:
+                print(f"  Region {region_idx}: Pulled {adjusted} movables inside")
+                total_adjusted += adjusted
+
     if total_adjusted > 0:
         print(f"  Total: {total_adjusted} movables adjusted")
     else:
         print("  All movables already inside their regions")
 
+    # ========== AUTO-TUNE SEARCH PARAMETERS FROM OBJECT SIZES ==========
+    _obj_dims = []
+    for mov in movables:
+        verts = np.array(mov["verts"])
+        w = float(verts[:, 0].max() - verts[:, 0].min())
+        h = float(verts[:, 1].max() - verts[:, 1].min())
+        _obj_dims.append((w, h))
+
+    _min_dims = [min(w, h) for w, h in _obj_dims]
+    _max_dims = [max(w, h) for w, h in _obj_dims]
+
+    # search_step: 40% of the median smallest dimension.
+    # Gives ~2-3 slot choices per typical object width — fine enough without blowing up slot count.
+    search_step = float(np.clip(np.min(_min_dims) * 0.2, 0.05, 2.0))
+
+    # max_search_radius: 8x the median largest dimension.
+    # Allows each object to travel ~8 object-lengths before giving up.
+    max_search_radius = float(np.clip(np.max(_max_dims) * 4.0, 2.0, 200.0))
+
+    print(
+        f"\nAuto-tuned parameters from {len(_obj_dims)} objects:\n"
+        f"  obj smallest dim: min={min(_min_dims):.3f}, median={np.median(_min_dims):.3f}, max={max(_min_dims):.3f}\n"
+        f"  obj largest dim:  min={min(_max_dims):.3f}, median={np.median(_max_dims):.3f}, max={max(_max_dims):.3f}\n"
+        f"  → search_step={search_step:.3f}, max_search_radius={max_search_radius:.2f}"
+    )
+
     # ========== GREEDY OPTIMIZE EACH REGION ==========
     print("\n" + "=" * 80)
     print("STAGE 2: Greedy placement optimization (guarantees 0 overlaps)")
     print("=" * 80)
-    
+
     start_time = time.time()
-    
+
     all_results, all_x0s, region_indices = greedy_optimize_with_regions(
         movables_per_region,
         fixed_per_region,
         regions_info,
         min_separation=0.01,
-        search_step=0.3,
-        max_search_radius=50.0,
+        search_step=search_step,
+        max_search_radius=max_search_radius,
     )
     
     opt_time = time.time() - start_time
@@ -506,9 +549,9 @@ def main():
     # ========== VERIFICATION ==========
     print("\nVerifying results...")
     
-    # SAT-based check
-    sat_overlaps = find_all_overlaps(combined_result, movables, all_fixed, min_separation=0.0)
-    print(f"SAT-based overlap check: {len(sat_overlaps)} overlaps")
+    # # SAT-based check
+    # sat_overlaps = find_all_overlaps(combined_result, movables, all_fixed, min_separation=0.0)
+    # print(f"SAT-based overlap check: {len(sat_overlaps)} overlaps")
     
     # Shapely-based check (ground truth)
     shapely_overlaps = verify_overlaps_shapely(combined_result, movables, all_fixed, min_separation=0.0)
@@ -522,19 +565,43 @@ def main():
         if len(shapely_overlaps) > 10:
             print(f"  ... and {len(shapely_overlaps) - 10} more")
     
-    # Per-region overlap check
-    print("\nPer-region overlap check:")
-    for i, (movs, fixed, result) in enumerate(zip(movables_per_region, fixed_per_region, all_results)):
-        if len(movs) == 0:
-            continue
-        region_result = []
-        for mov in movs:
-            orig_idx = element_to_idx[(mov["ElementId"], mov["SegmentIndex"])]
-            region_result.extend(combined_result[orig_idx * 2 : orig_idx * 2 + 2])
-        region_result = np.array(region_result)
-        overlaps = find_all_overlaps(region_result, movs, fixed, min_separation=0.0)
-        status = "✓" if len(overlaps) == 0 else "✗"
-        print(f"  Region {i}: {len(overlaps)} overlaps {status}")
+    # Cross-region vs within-region overlap breakdown
+    if len(shapely_overlaps) > 0:
+        # Map each original movable index to its region
+        orig_to_region = {}
+        for region_idx, region_movables in enumerate(movables_per_region):
+            for mov in region_movables:
+                oi = element_to_idx[(mov["ElementId"], mov["SegmentIndex"])]
+                orig_to_region[oi] = region_idx
+
+        cross_region = 0
+        within_region = 0
+        mov_fix_count = 0
+        for ov in shapely_overlaps:
+            ov_type, idx1, idx2, area = ov
+            if ov_type == "mov-mov":
+                r1 = orig_to_region.get(idx1, -1)
+                r2 = orig_to_region.get(idx2, -1)
+                if r1 != r2:
+                    cross_region += 1
+                else:
+                    within_region += 1
+            else:
+                mov_fix_count += 1
+        print(f"\n  mov-mov within-region: {within_region}, cross-region: {cross_region}")
+        print(f"  mov-fix: {mov_fix_count}")
+        if within_region > 0:
+            # Show per-region breakdown of within-region overlaps
+            region_overlap_counts = {}
+            for ov in shapely_overlaps:
+                ov_type, idx1, idx2, area = ov
+                if ov_type == "mov-mov":
+                    r1 = orig_to_region.get(idx1, -1)
+                    r2 = orig_to_region.get(idx2, -1)
+                    if r1 == r2 and r1 >= 0:
+                        region_overlap_counts[r1] = region_overlap_counts.get(r1, 0) + 1
+            for ri, cnt in sorted(region_overlap_counts.items()):
+                print(f"    Region {ri}: {cnt} within-region overlaps")
 
     # ========== METRICS ==========
     print("\n" + "=" * 80)
@@ -545,9 +612,17 @@ def main():
     print(f"Average displacement: {displacement_metric:.4f}")
     print(f"Final overlaps (Shapely): {len(shapely_overlaps)}")
 
+    # Build set of movable indices that are still overlapping
+    overlapping_indices = set()
+    for ov in shapely_overlaps:
+        ov_type, idx1, idx2, area = ov
+        overlapping_indices.add(idx1)
+        if ov_type == "mov-mov":
+            overlapping_indices.add(idx2)
+
     # ========== SAVE OUTPUT ==========
     print("\nSaving output...")
-    save_optimized_output(combined_result, movables, output_path="output.json")
+    save_optimized_output(combined_result, movables, overlapping_indices, output_path="output.json")
     print("Saved output.json")
 
     # ========== VISUALIZE FINAL RESULT ==========
@@ -589,6 +664,7 @@ def main():
         fixed_obstacles_original,
         fixed_obstacles_original,
         placement_bounds,
+        overlapping_indices=overlapping_indices,
     )
     print("Visualization complete!")
 

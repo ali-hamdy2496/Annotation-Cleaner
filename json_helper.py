@@ -26,7 +26,7 @@ def load_problem_data(json_path):
     for item in data:
         origin = np.array([item["Origin"]["X"], item["Origin"]["Y"]])
         origin_z = item["Origin"]["Z"]
-        verts_absolute = np.array([[v["x"], v["y"]] for v in item["Vertices"]])
+        verts_absolute = np.array([[v["X"], v["Y"]] for v in item["Vertices"]])
         # verts_z = [v["Z"] for v in item["Vertices"]]
         verts_local = verts_absolute - origin
 
@@ -35,8 +35,6 @@ def load_problem_data(json_path):
             "ElementId": item["ElementId"],
             "RotationAngle": item["RotationAngle"],
             "ElementType": item["ElementType"],
-            "CategoryName": item["CategoryName"],
-            "BuiltInCategory": item["BuiltInCategory"],
             "SegmentIndex": item["SegmentIndex"]
         }
 
@@ -54,7 +52,7 @@ def load_problem_data(json_path):
     all_coords = []
     for item in data:
         for v in item["Vertices"]:
-            all_coords.append([v["x"], v["y"]])
+            all_coords.append([v["X"], v["Y"]])
 
     all_coords = np.array(all_coords)
     x_min, y_min = all_coords.min(axis=0)
@@ -74,7 +72,7 @@ def load_problem_data(json_path):
     return movables, fixed_obstacles, placement_bounds
 
 
-def save_optimized_output(xvec, movables, output_path="output.json"):
+def save_optimized_output(xvec, movables, overlapping_indices=None, output_path="output.json"):
     """
     Save the optimized movables to a JSON file with the same format as the input.
 
@@ -95,6 +93,7 @@ def save_optimized_output(xvec, movables, output_path="output.json"):
         )
 
         # Create output element
+        state = "not_solved" if (overlapping_indices is not None and i in overlapping_indices) else "solved"
         element = {
             "ElementId": movable["ElementId"],
             "IsMovable": True,
@@ -105,13 +104,12 @@ def save_optimized_output(xvec, movables, output_path="output.json"):
                 "Z": float(movable["origin_z"]),
             },
             "Vertices": [
-                {"x": float(v[0]), "y": float(v[1])}
+                {"X": float(v[0]), "Y": float(v[1])}
                 for j, v in enumerate(verts_absolute)
             ],
             "ElementType": movable["ElementType"],
-            "CategoryName": movable["CategoryName"],
-            "BuiltInCategory": movable["BuiltInCategory"],
-            "SegmentIndex": movable["SegmentIndex"]
+            "SegmentIndex": movable["SegmentIndex"],
+            "state": state,
         }
 
         output_data.append(element)

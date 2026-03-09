@@ -227,7 +227,7 @@ def plot_regions(regions_info, movables_per_region, fixed_per_region, placement_
 
 
 def plot_result(
-    xvec, xvec_initial, movables, fixed_obstacles_before, fixed_obstacles_after, placement_bounds, search_radius=None
+    xvec, xvec_initial, movables, fixed_obstacles_before, fixed_obstacles_after, placement_bounds, search_radius=None, overlapping_indices=None
 ):
     """
     Plot the optimization results showing before and after states in separate files.
@@ -345,20 +345,31 @@ def plot_result(
             ax2.plot(poly_hull[:, 0], poly_hull[:, 1], "darkred", linewidth=0.25)
 
     # plot movables at OPTIMIZED positions
+    solved_labeled = False
+    not_solved_labeled = False
     for i, p in enumerate(pts):
         poly = translate_polygon(movables[i]["verts"], p, movables[i]["RotationAngle"])
         poly_hull = get_convex_hull_vertices(poly, closed=True)
+        is_overlapping = overlapping_indices is not None and i in overlapping_indices
+        if is_overlapping:
+            facecolor, edgecolor = "red", "darkred"
+            label = "Not Solved" if not not_solved_labeled else ""
+            not_solved_labeled = True
+        else:
+            facecolor, edgecolor = "blue", "darkblue"
+            label = "Solved" if not solved_labeled else ""
+            solved_labeled = True
         polygon_patch = Polygon(
             poly_hull[:-1],
             closed=True,
-            facecolor="blue",
+            facecolor=facecolor,
             alpha=0.4,
-            edgecolor="darkblue",
+            edgecolor=edgecolor,
             linewidth=0.5,
-            label="Movable Objects" if i == 0 else "",
+            label=label,
         )
         ax2.add_patch(polygon_patch)
-        ax2.plot(poly_hull[:, 0], poly_hull[:, 1], "darkblue", linewidth=0.25)
+        ax2.plot(poly_hull[:, 0], poly_hull[:, 1], edgecolor, linewidth=0.25)
         
         # Show ORIGINAL target point (where the object wanted to be)
         # This shows the displacement from original target to final position
