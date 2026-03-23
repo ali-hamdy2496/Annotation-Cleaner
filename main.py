@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon as MplPolygon, Patch
 from shapely.geometry import Polygon as ShapelyPolygon
 
-from json_helper import load_problem_data, save_optimized_output
+from json_helper import load_problem_data, load_problem_data_from_list, save_optimized_output, build_output_data
 from plotting import plot_result
 from region_simple import split_into_regions
 from greedy_optimizer import (
@@ -348,6 +348,189 @@ def verify_overlaps_shapely(result, movables, fixed_obstacles, min_separation=0.
                 overlaps.append(("mov-fix", mi, obs.get("ElementId", "?"), ix.area))
 
     return overlaps
+
+
+def run_optimization(input_data):
+    """
+    Run the full optimization pipeline on parsed JSON data.
+
+    Args:
+        input_data: List of element dicts (same structure as the input JSON file)
+
+    Returns:
+        dict with keys:
+            - "output_data": list of output element dicts (same as output.json)
+            - "num_overlaps": int
+            - "avg_displacement": float
+            - "total_time": float (seconds)
+    """
+    np.random.seed(0)
+
+    movables, fixed_obstacles, placement_bounds = load_problem_data_from_list(input_data)
+    return _run_optimization_core(movables, fixed_obstacles, placement_bounds)
+
+
+def _run_optimization_core(movables, fixed_obstacles, placement_bounds, save_visuals=False):
+    """Core optimization logic shared by run_optimization and main."""
+    print(f"Loaded {len(movables)} movables and {len(fixed_obstacles)} fixed obstacles")
+    print(f"Placement bounds: X={placement_bounds[0]}, Y={placement_bounds[1]}")
+
+    n_pipes = sum(1 for obs in fixed_obstacles if obs.get("ElementType") == "Pipe")
+    print(f"Pipes: {n_pipes}")
+
+    total_start_time = time.time()
+
+    # ========== SPLIT INTO REGIONS ==========
+    print("\n" + "=" * 80)
+    print("STAGE 1: Splitting space into regions (pipe subtraction method)")
+    print("=" * 80)
+
+    start_time = time.time()
+    use_regions = n_pipes > 0 and len(movables) > 15
+
+    if use_regions:
+        fixed_per_region, movables_per_region, regions_info = split_into_regions(
+            movables, fixed_obstacles, placement_bounds,
+            pipe_buffer=0.5, min_region_area=10.0, min_separation=0.001,
+        )
+        if len(regions_info) <= 1:
+            print("Only 1 region created, falling back to single-region mode")
+            use_regions = False
+    else:
+        print("Skipping region splitting (no pipes or too few movables)")
+
+    if not use_regions:
+        all_fixed_single = [obs for obs in fixed_obstacles if obs.get("center") is not None]
+        (xmin, xmax), (ymin, ymax) = placement_bounds
+        single_boundary = [(xmin, ymin), (xmax, ymin), (xmax, ymax), (xmin, ymax), (xmin, ymin)]
+        single_poly = ShapelyPolygon(single_boundary)
+        regions_info = [{"index": 0, "boundary": single_boundary, "area": single_poly.area, "shapely_polygon": single_poly}]
+        movables_per_region = [movables]
+        fixed_per_region = [all_fixed_single]
+
+    split_time = time.time() - start_time
+    print(f"\nRegion splitting completed in {split_time:.2f} seconds")
+    print(f"Created {len(regions_info)} regions:")
+
+    total_movables = 0
+    total_fixed = 0
+    for i, r in enumerate(regions_info):
+        n_mov = len(movables_per_region[i])
+        n_fix = len(fixed_per_region[i])
+        n_pipes_region = sum(1 for obs in fixed_per_region[i] if obs.get("ElementType") == "Pipe")
+        total_movables += n_mov
+        total_fixed += n_fix
+        print(f"  Region {i}: area={r['area']:.2f}, movables={n_mov}, fixed={n_fix}, pipes={n_pipes_region}")
+    print(f"Total: {total_movables} movables, {total_fixed} fixed obstacle assignments")
+
+    # ========== PRE-PROCESSING ==========
+    print("\n" + "=" * 80)
+    print("STAGE 1.5: Pull movables fully inside their assigned regions")
+    print("=" * 80)
+
+    total_adjusted = 0
+
+    def pull_region(args):
+        region_idx, movs, region_info = args
+        if len(movs) == 0 or region_info.get("shapely_polygon") is None:
+            return region_idx, 0
+        adjusted = pull_movables_into_region(movs, region_info["shapely_polygon"], min_margin=0.1)
+        return region_idx, adjusted
+
+    with ThreadPoolExecutor() as executor:
+        futures = {
+            executor.submit(pull_region, (i, movs, ri)): i
+            for i, (movs, ri) in enumerate(zip(movables_per_region, regions_info))
+        }
+        for future in as_completed(futures):
+            region_idx, adjusted = future.result()
+            if adjusted > 0:
+                print(f"  Region {region_idx}: Pulled {adjusted} movables inside")
+                total_adjusted += adjusted
+
+    if total_adjusted > 0:
+        print(f"  Total: {total_adjusted} movables adjusted")
+    else:
+        print("  All movables already inside their regions")
+
+    # ========== AUTO-TUNE ==========
+    _obj_dims = []
+    for mov in movables:
+        verts = np.array(mov["verts"])
+        w = float(verts[:, 0].max() - verts[:, 0].min())
+        h = float(verts[:, 1].max() - verts[:, 1].min())
+        _obj_dims.append((w, h))
+
+    _min_dims = [min(w, h) for w, h in _obj_dims]
+    _max_dims = [max(w, h) for w, h in _obj_dims]
+    search_step = float(np.clip(np.min(_min_dims) * 0.2, 0.05, 2.0))
+    max_search_radius = float(np.clip(np.max(_max_dims) * 4.0, 2.0, 200.0))
+
+    print(f"\nAuto-tuned parameters from {len(_obj_dims)} objects:\n"
+          f"  obj smallest dim: min={min(_min_dims):.3f}, median={np.median(_min_dims):.3f}, max={max(_min_dims):.3f}\n"
+          f"  obj largest dim:  min={min(_max_dims):.3f}, median={np.median(_max_dims):.3f}, max={max(_max_dims):.3f}\n"
+          f"  → search_step={search_step:.3f}, max_search_radius={max_search_radius:.2f}")
+
+    # ========== OPTIMIZE ==========
+    print("\n" + "=" * 80)
+    print("STAGE 2: Greedy placement optimization (guarantees 0 overlaps)")
+    print("=" * 80)
+
+    start_time = time.time()
+    all_results, all_x0s, region_indices = greedy_optimize_with_regions(
+        movables_per_region, fixed_per_region, regions_info,
+        min_separation=0.01, search_step=search_step, max_search_radius=max_search_radius,
+    )
+    opt_time = time.time() - start_time
+    print(f"\nGreedy optimization completed in {opt_time:.2f} seconds ({opt_time/60:.2f} minutes)")
+
+    # ========== COMBINE RESULTS ==========
+    print("\n" + "=" * 80)
+    print("STAGE 3: Combining and verifying results")
+    print("=" * 80)
+
+    combined_result, combined_x0 = combine_region_results(all_results, all_x0s, movables_per_region, movables)
+
+    element_to_idx = {(m["ElementId"], m["SegmentIndex"]): i for i, m in enumerate(movables)}
+    for region_movables, result in zip(movables_per_region, all_results):
+        for local_idx, mov in enumerate(region_movables):
+            original_idx = element_to_idx[(mov["ElementId"], mov["SegmentIndex"])]
+            movables[original_idx]["target"] = result[local_idx * 2 : local_idx * 2 + 2].copy()
+            combined_result[original_idx * 2] = result[local_idx * 2]
+            combined_result[original_idx * 2 + 1] = result[local_idx * 2 + 1]
+
+    all_fixed = [obs for obs in fixed_obstacles if obs.get("center") is not None]
+
+    # ========== VERIFICATION ==========
+    print("\nVerifying results...")
+    shapely_overlaps = verify_overlaps_shapely(combined_result, movables, all_fixed, min_separation=0.0)
+    print(f"Shapely-based overlap check: {len(shapely_overlaps)} overlaps")
+
+    # ========== METRICS ==========
+    displacement_metric = calculate_displacement_metric(combined_x0, combined_result)
+
+    overlapping_indices = set()
+    for ov in shapely_overlaps:
+        ov_type, idx1, idx2, area = ov
+        overlapping_indices.add(idx1)
+        if ov_type == "mov-mov":
+            overlapping_indices.add(idx2)
+
+    total_time = time.time() - total_start_time
+
+    # Build output data
+    output_data = build_output_data(combined_result, movables, overlapping_indices)
+
+    print(f"\nTotal time: {total_time:.2f}s")
+    print(f"Average displacement: {displacement_metric:.4f}")
+    print(f"Final overlaps: {len(shapely_overlaps)}")
+
+    return {
+        "output_data": output_data,
+        "num_overlaps": len(shapely_overlaps),
+        "avg_displacement": float(displacement_metric),
+        "total_time": float(total_time),
+    }
 
 
 def main():

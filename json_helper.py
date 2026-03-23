@@ -20,6 +20,23 @@ def load_problem_data(json_path):
     with open(json_path, "r") as f:
         data = json.load(f)
 
+    return _parse_problem_data(data)
+
+
+def load_problem_data_from_list(data):
+    """
+    Load movables and fixed obstacles from a list of dicts (parsed JSON).
+
+    Args:
+        data: List of element dictionaries (same structure as the JSON file)
+
+    Returns:
+        Tuple of (movables, fixed_obstacles, placement_bounds)
+    """
+    return _parse_problem_data(data)
+
+
+def _parse_problem_data(data):
     movables = []
     fixed_obstacles = []
 
@@ -70,6 +87,42 @@ def load_problem_data(json_path):
     )
 
     return movables, fixed_obstacles, placement_bounds
+
+
+def build_output_data(xvec, movables, overlapping_indices=None):
+    """
+    Build the output data list (same structure as save_optimized_output but returns
+    the list instead of writing to file).
+    """
+    pts = unpack_xy(xvec)
+    output_data = []
+
+    for i, p in enumerate(pts):
+        movable = movables[i]
+        verts_absolute = translate_polygon(
+            movable["verts"], p, movable["RotationAngle"]
+        )
+        state = "not_solved" if (overlapping_indices is not None and i in overlapping_indices) else "solved"
+        element = {
+            "ElementId": movable["ElementId"],
+            "IsMovable": True,
+            "RotationAngle": movable["RotationAngle"],
+            "Origin": {
+                "X": float(p[0]),
+                "Y": float(p[1]),
+                "Z": float(movable["origin_z"]),
+            },
+            "Vertices": [
+                {"X": float(v[0]), "Y": float(v[1])}
+                for v in verts_absolute
+            ],
+            "ElementType": movable["ElementType"],
+            "SegmentIndex": movable["SegmentIndex"],
+            "state": state,
+        }
+        output_data.append(element)
+
+    return output_data
 
 
 def save_optimized_output(xvec, movables, overlapping_indices=None, output_path="output.json"):

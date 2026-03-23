@@ -1,4 +1,4 @@
-FROM nvidia/cuda:13.0.1-devel-ubuntu22.04
+FROM ubuntu:22.04
 
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     build-essential \
