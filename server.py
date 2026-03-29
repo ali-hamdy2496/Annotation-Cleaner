@@ -127,11 +127,13 @@ def submit_job():
 @app.route("/status", methods=["GET"])
 def get_status():
     """
-    Get status of all jobs (without output_data).
+    Get status of all jobs.
+    output_data is included only for completed jobs; null otherwise.
     """
     with jobs_lock:
         snapshot = {}
         for jid, info in jobs.items():
+            completed = info["status"] == "completed"
             snapshot[jid] = {
                 "status": info["status"],
                 "submitted_at": info.get("submitted_at"),
@@ -141,36 +143,10 @@ def get_status():
                 "avg_displacement": info.get("avg_displacement"),
                 "total_time": info.get("total_time"),
                 "error": info.get("error"),
+                "output_data": info.get("output_data") if completed else None,
             }
 
     return jsonify({"jobs": snapshot}), 200
-
-
-@app.route("/result/<job_id>", methods=["GET"])
-def get_result(job_id):
-    """
-    Get full result for a completed job, including output_data.
-    """
-    with jobs_lock:
-        info = jobs.get(job_id) or jobs.get(int(job_id) if job_id.isdigit() else job_id)
-
-    if info is None:
-        return jsonify({"error": f"Job {job_id} not found"}), 404
-
-    if info["status"] not in ("completed", "failed"):
-        return jsonify({"error": f"Job {job_id} is still {info['status']}"}), 202
-
-    if info["status"] == "failed":
-        return jsonify({"job_id": job_id, "status": "failed", "error": info.get("error")}), 200
-
-    return jsonify({
-        "job_id": job_id,
-        "status": "completed",
-        "num_overlaps": info.get("num_overlaps"),
-        "avg_displacement": info.get("avg_displacement"),
-        "total_time": info.get("total_time"),
-        "output_data": info.get("output_data"),
-    }), 200
 
 
 if __name__ == "__main__":

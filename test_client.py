@@ -96,8 +96,9 @@ def main():
         print("Submit failed, exiting.")
         return
 
-    # Poll status every 2 seconds until completed/failed
+    # Poll /status every 2 seconds until completed/failed
     print("\nPolling /status every 2 seconds...\n")
+    job_info = None
     while True:
         time.sleep(2)
         try:
@@ -121,26 +122,21 @@ def main():
         except Exception as e:
             print(f"  Status poll error: {e}")
 
-    # Fetch full result
-    print(f"\nFetching result from {SERVER_URL}/result/{JOB_ID} ...")
-    result_resp = requests.get(f"{SERVER_URL}/result/{JOB_ID}", timeout=120)
-    result = result_resp.json()
-
     print(f"\n{'=' * 60}")
-    print(f"Job {result.get('job_id', JOB_ID)} — {result['status']}")
+    print(f"Job {JOB_ID} — {job_info['status']}")
 
-    if result["status"] == "completed":
-        print(f"  Overlaps:         {result['num_overlaps']}")
-        print(f"  Avg displacement: {result['avg_displacement']:.4f}")
-        print(f"  Total time:       {result['total_time']:.2f}s")
+    if job_info["status"] == "completed":
+        print(f"  Overlaps:         {job_info['num_overlaps']}")
+        print(f"  Avg displacement: {job_info['avg_displacement']:.4f}")
+        print(f"  Total time:       {job_info['total_time']:.2f}s")
 
-        output_data = result["output_data"]
+        output_data = job_info["output_data"]
         print(f"  Output elements:  {len(output_data)}")
 
         # Plot before/after
         plot_before_after(input_data, output_data)
     else:
-        print(f"  Error: {result.get('error', 'unknown')}")
+        print(f"  Error: {job_info.get('error', 'unknown')}")
 
     print(f"{'=' * 60}")
 

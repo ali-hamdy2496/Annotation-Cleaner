@@ -111,7 +111,7 @@ curl -X POST http://localhost:5000/submit \
 
 **`GET /status`**
 
-Returns the status of all known jobs (does not include `output_data` to keep the response lightweight).
+Returns the status of all known jobs. `output_data` is included for completed jobs and `null` for all others.
 
 #### Request
 
@@ -136,7 +136,24 @@ curl http://localhost:5000/status
             "num_overlaps": 0,
             "avg_displacement": 3.42,
             "total_time": 12.333,
-            "error": null
+            "error": null,
+            "output_data": [
+                {
+                    "ElementId": 11755664,
+                    "IsMovable": true,
+                    "RotationAngle": 0,
+                    "Origin": { "X": 722.4, "Y": -485.7, "Z": 207.9 },
+                    "Vertices": [
+                        { "X": 721.5, "Y": -487.6 },
+                        { "X": 723.3, "Y": -487.6 },
+                        { "X": 723.3, "Y": -483.7 },
+                        { "X": 721.5, "Y": -483.7 }
+                    ],
+                    "ElementType": "...",
+                    "SegmentIndex": 0,
+                    "state": "solved"
+                }
+            ]
         },
         "job_002": {
             "status": "running",
@@ -146,7 +163,8 @@ curl http://localhost:5000/status
             "num_overlaps": null,
             "avg_displacement": null,
             "total_time": null,
-            "error": null
+            "error": null,
+            "output_data": null
         },
         "job_003": {
             "status": "failed",
@@ -156,7 +174,8 @@ curl http://localhost:5000/status
             "num_overlaps": null,
             "avg_displacement": null,
             "total_time": null,
-            "error": "Invalid input format"
+            "error": "Invalid input format",
+            "output_data": null
         }
     }
 }
@@ -171,87 +190,19 @@ curl http://localhost:5000/status
 | `completed` | Finished successfully                |
 | `failed`    | Finished with an error               |
 
-**Timestamp fields** (`submitted_at`, `started_at`, `finished_at`) are Unix epoch seconds (`float`). `null` means that stage has not been reached yet.
+**Response fields per job:**
 
----
-
-### 3. Get Result
-
-**`GET /result/<job_id>`**
-
-Get the full result for a specific job, including the optimized `output_data`.
-
-#### Request
-
-No body required. The job ID is in the URL path.
-
-**Example `curl`:**
-```bash
-curl http://localhost:5000/result/job_001
-```
-
-#### Responses
-
-**`200 OK` — Job completed:**
-```json
-{
-    "job_id": "job_001",
-    "status": "completed",
-    "num_overlaps": 0,
-    "avg_displacement": 3.42,
-    "total_time": 12.333,
-    "output_data": [
-      {
-        "id": 1,
-        "x": 100.0,
-        "y": 200.0,
-        "width": 50.0,
-        "height": 20.0
-      },
-      {
-        "id": 2,
-        "x": 125.0,
-        "y": 225.0,
-        "width": 50.0,
-        "height": 20.0
-      }
-    ]
-}
-```
-
-**Result fields:**
-
-| Field              | Type   | Description                                              |
-|--------------------|--------|----------------------------------------------------------|
-| `job_id`           | string | The job identifier                                       |
-| `status`           | string | Always `"completed"` in this response                    |
-| `num_overlaps`     | int    | Number of remaining overlaps after optimization          |
-| `avg_displacement` | float  | Average displacement of annotations from original positions |
-| `total_time`       | float  | Total processing time in seconds                         |
-| `output_data`      | array  | Optimized annotation elements in the same format as input |
-
-**`200 OK` — Job failed:**
-```json
-{
-    "job_id": "job_001",
-    "status": "failed",
-    "error": "Invalid input format"
-}
-```
-
-**`202 Accepted` — Job still in progress:**
-```json
-{
-    "error": "Job job_001 is still running"
-}
-```
-
-**`404 Not Found` — Job does not exist:**
-```json
-{
-    "error": "Job job_001 not found"
-}
-```
+| Field              | Type         | Description                                                      |
+|--------------------|--------------|------------------------------------------------------------------|
+| `status`           | string       | Current job state (see table above)                              |
+| `submitted_at`     | float / null | Unix timestamp when the job was received                         |
+| `started_at`       | float / null | Unix timestamp when processing began                             |
+| `finished_at`      | float / null | Unix timestamp when the job finished                             |
+| `num_overlaps`     | int / null   | Remaining overlaps after optimization (`completed` only)         |
+| `avg_displacement` | float / null | Average annotation displacement from original (`completed` only) |
+| `total_time`       | float / null | Processing time in seconds (`completed` only)                    |
+| `error`            | string / null| Error message (`failed` only)                                    |
+| `output_data`      | array / null | Optimized annotation elements (`completed` only, `null` otherwise) |
 
 ---
 
@@ -287,10 +238,9 @@ The callback request has a **30-second timeout**. If delivery fails, the error i
 ## Typical Workflow
 
 ```
-1.  POST /submit          →  202  { "job_id": "job_001" }
-2.  GET  /status          →  200  { "jobs": { "job_001": { "status": "running", ... } } }
-3.  GET  /status          →  200  { "jobs": { "job_001": { "status": "completed", ... } } }
-4.  GET  /result/job_001  →  200  { "status": "completed", "output_data": [...], ... }
+1.  POST /submit  →  202  { "job_id": "job_001" }
+2.  GET  /status  →  200  { "jobs": { "job_001": { "status": "running",   "output_data": null, ... } } }
+3.  GET  /status  →  200  { "jobs": { "job_001": { "status": "completed", "output_data": [...], ... } } }
 ```
 
 Or, skip polling entirely by providing a `callback_url` in step 1.
