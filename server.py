@@ -10,6 +10,7 @@ Endpoints:
 import os
 import threading
 import time
+import psutil
 import requests as req_lib
 from flask import Flask, request, jsonify
 
@@ -22,14 +23,44 @@ jobs = {}
 jobs_lock = threading.Lock()
 
 
+def _monitor_performance(job_id, stop_event):
+    """Log CPU and RAM usage every 2 seconds until stop_event is set."""
+    logs = []
+    total_cores = psutil.cpu_count(logical=True)
+    total_ram = psutil.virtual_memory().total
+    while not stop_event.is_set():
+        cpu_percent = psutil.cpu_percent(interval=2)
+        mem = psutil.virtual_memory()
+        logs.append({
+            "timestamp": time.time(),
+            "cpu_percent": cpu_percent,
+            "cpu_cores_total": total_cores,
+            "cpu_cores_used": round(cpu_percent / 100 * total_cores, 2),
+            "ram_total_bytes": total_ram,
+            "ram_used_bytes": mem.used,
+            "ram_percent": mem.percent,
+        })
+    with jobs_lock:
+        jobs[job_id]["performance"] = logs
+
+
 def _run_job(job_id, input_data, callback_url):
     """Run optimization in a background thread and optionally POST results to callback_url."""
     with jobs_lock:
         jobs[job_id]["status"] = "running"
         jobs[job_id]["started_at"] = time.time()
 
+    stop_event = threading.Event()
+    monitor_thread = threading.Thread(
+        target=_monitor_performance, args=(job_id, stop_event), daemon=True
+    )
+    monitor_thread.start()
+
     try:
         result = run_optimization(input_data)
+
+        stop_event.set()
+        monitor_thread.join()
 
         with jobs_lock:
             jobs[job_id]["status"] = "completed"
@@ -58,6 +89,9 @@ def _run_job(job_id, input_data, callback_url):
                     jobs[job_id]["callback_error"] = str(e)
 
     except Exception as e:
+        stop_event.set()
+        monitor_thread.join()
+
         with jobs_lock:
             jobs[job_id]["status"] = "failed"
             jobs[job_id]["finished_at"] = time.time()
@@ -144,6 +178,7 @@ def get_status():
                 "total_time": info.get("total_time"),
                 "error": info.get("error"),
                 "output_data": info.get("output_data") if completed else None,
+                "performance": info.get("performance", []) if completed else [],
             }
 
     return jsonify({"jobs": snapshot}), 200
