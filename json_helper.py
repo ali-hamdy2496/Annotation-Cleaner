@@ -75,11 +75,13 @@ def _parse_problem_data(data):
     x_min, y_min = all_coords.min(axis=0)
     x_max, y_max = all_coords.max(axis=0)
 
-    # Add margin (20% of the range on each side)
+    # Add a modest margin (10% of the range on each side).
+    # Keeps breathing room for edge placements without making the outer
+    # "leftover" region (Region 0) as unnecessarily large as 20%.
     x_range = x_max - x_min
     y_range = y_max - y_min
-    margin_x = 0.2 * x_range
-    margin_y = 0.2 * y_range
+    margin_x = 0.1 * x_range
+    margin_y = 0.1 * y_range
 
     placement_bounds = (
         (x_min - margin_x, x_max + margin_x),
