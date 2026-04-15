@@ -21,7 +21,7 @@ from region_simple import split_into_regions
 from greedy_optimizer import (
     greedy_optimize_with_regions,
     pull_movables_into_region,
-
+    get_movable_polygon,
 )
 from utils import (
     calculate_displacement_metric,
@@ -464,7 +464,8 @@ def _run_optimization_core(movables, fixed_obstacles, placement_bounds, save_vis
     _min_dims = [min(w, h) for w, h in _obj_dims]
     _max_dims = [max(w, h) for w, h in _obj_dims]
     search_step = float(np.clip(np.min(_min_dims) * 0.2, 0.05, 2.0))
-    max_search_radius = float(np.clip(np.max(_max_dims) * 4.0, 2.0, 200.0))
+    # Use median (not max) so one large object doesn't inflate the radius for everyone.
+    max_search_radius = float(np.clip(np.median(_max_dims) * 4.0, 2.0, 25.0))
 
     print(f"\nAuto-tuned parameters from {len(_obj_dims)} objects:\n"
           f"  obj smallest dim: min={min(_min_dims):.3f}, median={np.median(_min_dims):.3f}, max={max(_min_dims):.3f}\n"
@@ -516,6 +517,24 @@ def _run_optimization_core(movables, fixed_obstacles, placement_bounds, save_vis
         if ov_type == "mov-mov":
             overlapping_indices.add(idx2)
 
+    # Also mark movables whose final polygon extends outside their assigned region
+    # as not_solved — these are objects the optimizer couldn't place inside.
+    outside_region_count = 0
+    for region_idx, region_movables in enumerate(movables_per_region):
+        region_poly = regions_info[region_idx].get("shapely_polygon")
+        if region_poly is None:
+            continue
+        for mov in region_movables:
+            orig_idx = element_to_idx[(mov["ElementId"], mov["SegmentIndex"])]
+            pos = combined_result[orig_idx * 2: orig_idx * 2 + 2]
+            mp = get_movable_polygon(mov, pos)
+            if mp is None or not region_poly.contains(mp):
+                if orig_idx not in overlapping_indices:
+                    outside_region_count += 1
+                overlapping_indices.add(orig_idx)
+    if outside_region_count > 0:
+        print(f"  {outside_region_count} additional movables outside their region — marked not_solved")
+
     total_time = time.time() - total_start_time
 
     # Build output data
@@ -537,7 +556,7 @@ def main():
     np.random.seed(0)
 
     # ========== LOAD DATA ==========
-    json_path = "AnnotationCleaner_CurveLoops.json"
+    json_path = "AnnotationCleaner_CurveLoops3.json"
     print(f"Loading data from {json_path}...")
     movables, fixed_obstacles, placement_bounds = load_problem_data(json_path)
 
@@ -674,9 +693,9 @@ def main():
     # Gives ~2-3 slot choices per typical object width — fine enough without blowing up slot count.
     search_step = float(np.clip(np.min(_min_dims) * 0.2, 0.05, 2.0))
 
-    # max_search_radius: 8x the median largest dimension.
-    # Allows each object to travel ~8 object-lengths before giving up.
-    max_search_radius = float(np.clip(np.max(_max_dims) * 4.0, 2.0, 200.0))
+    # max_search_radius: 4x the MEDIAN largest dimension (not max, to avoid one
+    # huge object inflating the search radius for every small object).
+    max_search_radius = float(np.clip(np.median(_max_dims) * 4.0, 2.0, 25.0))
 
     print(
         f"\nAuto-tuned parameters from {len(_obj_dims)} objects:\n"
@@ -802,6 +821,25 @@ def main():
         overlapping_indices.add(idx1)
         if ov_type == "mov-mov":
             overlapping_indices.add(idx2)
+
+    # Also mark movables whose final polygon extends outside their assigned region.
+    # These are objects the optimizer couldn't successfully place inside their region
+    # (usually because their original target was outside and pull/spiral both failed).
+    outside_region_count = 0
+    for region_idx, region_movables in enumerate(movables_per_region):
+        region_poly = regions_info[region_idx].get("shapely_polygon")
+        if region_poly is None:
+            continue
+        for mov in region_movables:
+            orig_idx = element_to_idx[(mov["ElementId"], mov["SegmentIndex"])]
+            pos = combined_result[orig_idx * 2: orig_idx * 2 + 2]
+            mp = get_movable_polygon(mov, pos)
+            if mp is None or not region_poly.contains(mp):
+                if orig_idx not in overlapping_indices:
+                    outside_region_count += 1
+                overlapping_indices.add(orig_idx)
+    if outside_region_count > 0:
+        print(f"  {outside_region_count} additional movables outside their region — marked not_solved")
 
     # ========== SAVE OUTPUT ==========
     print("\nSaving output...")

@@ -1079,376 +1079,74 @@ def greedy_optimize_region(
         result[idx * 2 + 1] = target[1]
         _record_placed(mov, target, mov_poly)
 
-    # PHASE 2: Table-grid placement with multi-cell spanning.
-    #
-    # Places ALL objects (valid_at_target + need_placement) into a structured
-    # row/column grid.  Cell size = 25th-percentile object size.  Each object
-    # spans ceil(obj_w / cell_w) cols x ceil(obj_h / cell_h) rows.  A 2D
-    # occupancy matrix tracks free cells.  Objects are assigned largest-first
-    # to the nearest free rectangular block.  Objects that don't fit in any
-    # block are placed via spiral search as fallback.
+    # PHASE 2: Place movable-fixed conflicts first (hardest — they must move).
+    # Then Phase 3 places everything else that still needs a slot.
 
-    align_indices = []  # (idx_in_movables, mov) for objects eligible for grid placement
-    seen_idx = set()
-    for idx, mov in valid_at_target:
-        if idx not in seen_idx:
-            align_indices.append((idx, mov))
-            seen_idx.add(idx)
+    def _size_key(im):
+        v = np.array(im[1]["verts"])
+        return (v[:, 0].max() - v[:, 0].min()) * (v[:, 1].max() - v[:, 1].min())
+
+    movable_fixed_conflicts = []
+    movable_other = []
     for idx, mov in need_placement:
-        if idx not in seen_idx:
-            align_indices.append((idx, mov))
-            seen_idx.add(idx)
+        target = np.array(mov["target"])
+        mov_poly = get_movable_polygon(mov, target)
+        if mov_poly is None:
+            movable_other.append((idx, mov))
+            continue
+        overlaps_fixed = (not obstacle_union.is_empty and
+                          mov_poly.buffer(min_separation / 2).intersects(obstacle_union))
+        if overlaps_fixed:
+            movable_fixed_conflicts.append((idx, mov))
+        else:
+            movable_other.append((idx, mov))
 
+    movable_fixed_conflicts.sort(key=_size_key, reverse=True)
+    print(f"    {len(movable_fixed_conflicts)} movable-fixed conflicts to place first")
+
+    still_need_placement = list(movable_other)
     failed_placements = []
 
-    if len(align_indices) >= 1 and region_poly is not None:
-        print(f"    Phase 2: Placing {len(align_indices)} objects into table grid...")
-
-        # --- Compute per-object widths/heights (using ROTATED verts) ---
-        obj_widths = []
-        obj_heights = []
-        obj_half_extents = []  # (half_w, half_h) max extent from local origin
-        for _, mov in align_indices:
-            v = np.array(mov["verts"], dtype=float)
-            rotation = mov.get("RotationAngle", 0.0)
-            if rotation != 0:
-                cos_r = np.cos(rotation)
-                sin_r = np.sin(rotation)
-                rot_matrix = np.array([[cos_r, -sin_r], [sin_r, cos_r]])
-                v = v @ rot_matrix.T
-            obj_widths.append(v[:, 0].max() - v[:, 0].min())
-            obj_heights.append(v[:, 1].max() - v[:, 1].min())
-            # Max extent from local origin in each direction (for asymmetric shapes)
-            half_w = max(abs(float(v[:, 0].max())), abs(float(v[:, 0].min())))
-            half_h = max(abs(float(v[:, 1].max())), abs(float(v[:, 1].min())))
-            obj_half_extents.append((half_w, half_h))
-        obj_widths = np.array(obj_widths)
-        obj_heights = np.array(obj_heights)
-
-        # --- Cell size = 25th-percentile object size (fine-grained grid) ---
-        cell_obj_w = float(np.percentile(obj_widths, 25))
-        cell_obj_h = float(np.percentile(obj_heights, 25))
-        cell_obj_w = max(cell_obj_w, float(obj_widths.min()))
-        cell_obj_h = max(cell_obj_h, float(obj_heights.min()))
-        cell_w = cell_obj_w + min_separation
-        cell_h = cell_obj_h + min_separation
-
-        # --- Build 2D occupancy grid ---
-        rb = region_poly.bounds  # (minx, miny, maxx, maxy)
-        grid_origin_x = rb[0] + cell_w / 2
-        grid_origin_y = rb[1] + cell_h / 2
-        n_cols = int(np.floor((rb[2] - rb[0]) / cell_w))
-        n_rows = int(np.floor((rb[3] - rb[1]) / cell_h))
-
-        grid_ok = n_cols >= 1 and n_rows >= 1
-        if grid_ok:
-            # occupancy: True = free, False = blocked
-            occupancy = np.ones((n_rows, n_cols), dtype=bool)
-
-            # Mark cells whose centre is outside the region as blocked
-            col_centres = grid_origin_x + np.arange(n_cols) * cell_w
-            row_centres = grid_origin_y + np.arange(n_rows) * cell_h
-            cc, rr = np.meshgrid(col_centres, row_centres)
-            inside = _vec_contains(region_poly, cc.ravel(), rr.ravel()).reshape(n_rows, n_cols)
-            occupancy &= inside
-
-            # Mark cells that intersect fixed obstacles as blocked
-            if not obstacle_union.is_empty:
-                half_w, half_h = cell_w / 2, cell_h / 2
-                # Build cell boxes only for currently-free cells
-                free_ri, free_ci = np.where(occupancy)
-                if len(free_ri) > 0:
-                    cell_boxes = [
-                        box(col_centres[ci] - half_w, row_centres[ri] - half_h,
-                            col_centres[ci] + half_w, row_centres[ri] + half_h)
-                        for ri, ci in zip(free_ri, free_ci)
-                    ]
-                    hits = _shp.intersects(np.array(cell_boxes), obstacle_union)
-                    occupancy[free_ri[hits], free_ci[hits]] = False
-
-            # Mark cells occupied by cant_fit objects
-            for idx_cf, mov_cf in cant_fit:
-                pos_cf = (result[idx_cf * 2], result[idx_cf * 2 + 1])
-                mp_cf = get_movable_polygon(mov_cf, pos_cf)
-                if mp_cf is not None:
-                    clipped = mp_cf.intersection(region_poly)
-                    if not clipped.is_empty:
-                        cb = clipped.buffer(min_separation / 2)
-                        bx0, by0, bx1, by1 = cb.bounds
-                        ci0 = max(0, int(np.floor((bx0 - rb[0]) / cell_w)))
-                        ci1 = min(n_cols - 1, int(np.floor((bx1 - rb[0]) / cell_w)))
-                        ri0 = max(0, int(np.floor((by0 - rb[1]) / cell_h)))
-                        ri1 = min(n_rows - 1, int(np.floor((by1 - rb[1]) / cell_h)))
-                        occupancy[ri0:ri1 + 1, ci0:ci1 + 1] = False
-
-            free_count = int(occupancy.sum())
-            print(f"    Table grid: {n_cols} cols x {n_rows} rows, "
-                  f"{free_count} cells free (cell {cell_w:.2f} x {cell_h:.2f})")
-            grid_ok = free_count >= 1
-
-        if grid_ok:
-            # --- Compute per-object spans ---
-            # Use max extent from local origin (not bounding box) so that objects
-            # with off-center origins don't extend beyond their grid block.
-            obj_spans = []
-            for i in range(len(align_indices)):
-                hw, hh = obj_half_extents[i]
-                safe_w = 2 * hw  # full width needed from block center
-                safe_h = 2 * hh
-                sc = max(1, int(np.ceil(safe_w / cell_w)))
-                sr = max(1, int(np.ceil(safe_h / cell_h)))
-                obj_spans.append((sc, sr))
-
-            # Sort by area (largest first) — big objects get first pick
-            order = sorted(range(len(align_indices)),
-                           key=lambda i: obj_widths[i] * obj_heights[i],
-                           reverse=True)
-
-            def _find_block(span_c, span_r, target_x, target_y):
-                """Find the nearest free block of span_c x span_r cells
-                to (target_x, target_y).  Fast local ring search first,
-                then vectorised full-grid fallback."""
-                max_ri = n_rows - span_r
-                max_ci = n_cols - span_c
-                if max_ri < 0 or max_ci < 0:
-                    return None
-
-                tc = (target_x - grid_origin_x) / cell_w
-                tr = (target_y - grid_origin_y) / cell_h
-                ci0 = int(round(tc - (span_c - 1) / 2.0))
-                ri0 = int(round(tr - (span_r - 1) / 2.0))
-
-                # Fast local ring search (covers most cases)
-                local_limit = 8
-                for ring in range(min(local_limit, max(n_rows, n_cols) + 1)):
-                    best = None
-                    best_dist = float('inf')
-                    r_lo = max(0, ri0 - ring)
-                    r_hi = min(max_ri, ri0 + ring)
-                    c_lo = max(0, ci0 - ring)
-                    c_hi = min(max_ci, ci0 + ring)
-                    for ri in range(r_lo, r_hi + 1):
-                        for ci in range(c_lo, c_hi + 1):
-                            if ring > 0 and r_lo < ri < r_hi and c_lo < ci < c_hi:
-                                continue
-                            if not occupancy[ri:ri + span_r, ci:ci + span_c].all():
-                                continue
-                            bc = ci + (span_c - 1) / 2.0
-                            br = ri + (span_r - 1) / 2.0
-                            d = (bc - tc) ** 2 + (br - tr) ** 2
-                            if d < best_dist:
-                                best_dist = d
-                                best = (ri, ci)
-                    if best is not None:
-                        return best
-
-                # Vectorised full-grid fallback using sliding window
-                vr = max_ri + 1
-                vc = max_ci + 1
-                windows = np.lib.stride_tricks.sliding_window_view(
-                    occupancy, (span_r, span_c))
-                valid = windows.all(axis=(2, 3))
-                valid_ri, valid_ci = np.where(valid)
-                if len(valid_ri) == 0:
-                    return None
-
-                bc = valid_ci + (span_c - 1) / 2.0
-                br = valid_ri + (span_r - 1) / 2.0
-                dists = (bc - tc) ** 2 + (br - tr) ** 2
-                nearest = np.argmin(dists)
-                return (int(valid_ri[nearest]), int(valid_ci[nearest]))
-
-            # --- Main grid assignment pass ---
-            grid_success = 0
-            grid_failed = []  # indices into align_indices that couldn't get a block
-            # Track placed polygons for polygon-level overlap validation
-            gp_polys = []       # buffered polygons of grid-placed objects
-            gp_positions = []   # placement positions
-            gp_max_radii = []   # max distance from origin to any vertex
-
-            for oi in order:
-                idx, mov = align_indices[oi]
-                span_c, span_r = obj_spans[oi]
-                target = np.array(mov["target"])
-
-                block = _find_block(span_c, span_r, target[0], target[1])
-                if block is None:
-                    grid_failed.append(oi)
-                    continue
-
-                ri0, ci0 = block
-                bx = grid_origin_x + (ci0 + (span_c - 1) / 2.0) * cell_w
-                by = grid_origin_y + (ri0 + (span_r - 1) / 2.0) * cell_h
-
-                # Validate full polygon
-                mp = get_movable_polygon(mov, (bx, by))
-                if mp is None or not region_poly.contains(mp):
-                    grid_failed.append(oi)
-                    continue
-                if not obstacle_union.is_empty and mp.buffer(min_separation / 2).intersects(obstacle_union):
-                    grid_failed.append(oi)
-                    continue
-
-                # Polygon-level overlap check against already-placed grid objects
-                if gp_positions:
-                    v = np.array(mov["verts"])
-                    obj_r = float(np.sqrt(v[:, 0] ** 2 + v[:, 1] ** 2).max())
-                    pos_arr = np.array(gp_positions)
-                    rad_arr = np.array(gp_max_radii)
-                    dists = np.linalg.norm(pos_arr - [bx, by], axis=1)
-                    nearby = np.where(dists < obj_r + rad_arr + min_separation)[0]
-                    if len(nearby) > 0:
-                        mp_buf = mp.buffer(min_separation / 2)
-                        nearby_polys = [gp_polys[n] for n in nearby]
-                        if np.any(_shp.intersects(mp_buf, np.array(nearby_polys))):
-                            grid_failed.append(oi)
-                            continue
-
-                # Commit
-                result[idx * 2] = bx
-                result[idx * 2 + 1] = by
-                occupancy[ri0:ri0 + span_r, ci0:ci0 + span_c] = False
-                gp_polys.append(mp.buffer(min_separation / 2))
-                gp_positions.append([bx, by])
-                v = np.array(mov["verts"])
-                gp_max_radii.append(float(np.sqrt(v[:, 0] ** 2 + v[:, 1] ** 2).max()))
-                grid_success += 1
-
-            # --- Fallback: spiral-place objects that couldn't get a grid block ---
-            # Build placed-polygons list from all grid-placed + cant_fit objects.
-            fb_placed_polys = []
-            fb_placed_positions = []
-            fb_placed_max_radii = []
-            for oi in order:
-                if oi in set(grid_failed):
-                    continue
-                idx, mov = align_indices[oi]
-                pos = (result[idx * 2], result[idx * 2 + 1])
-                mp = get_movable_polygon(mov, pos)
-                if mp is not None:
-                    fb_placed_polys.append(mp.buffer(min_separation / 2))
-                    fb_placed_positions.append([pos[0], pos[1]])
-                    v = np.array(mov["verts"])
-                    fb_placed_max_radii.append(float(np.sqrt(v[:, 0] ** 2 + v[:, 1] ** 2).max()))
-            for idx_cf, mov_cf in cant_fit:
-                pos_cf = (result[idx_cf * 2], result[idx_cf * 2 + 1])
-                mp_cf = get_movable_polygon(mov_cf, pos_cf)
-                if mp_cf is not None:
-                    clipped = mp_cf.intersection(region_poly)
-                    if not clipped.is_empty:
-                        fb_placed_polys.append(clipped.buffer(min_separation / 2))
-                        fb_placed_positions.append([pos_cf[0], pos_cf[1]])
-                        v = np.array(mov_cf["verts"])
-                        fb_placed_max_radii.append(float(np.sqrt(v[:, 0] ** 2 + v[:, 1] ** 2).max()))
-
-            spiral_count = 0
-            first_pass_failed = []  # (idx, mov) for objects that fail spiral
-            for oi in grid_failed:
-                idx, mov = align_indices[oi]
-                target = np.array(mov["target"])
-                new_pos = find_nearest_valid_position(
-                    mov, target, obstacle_union,
-                    fb_placed_polys, fb_placed_positions, fb_placed_max_radii,
-                    region_poly, valid_slots, slot_tree,
-                    min_separation, max_search_radius, search_step,
-                )
-                if new_pos is not None:
-                    result[idx * 2] = new_pos[0]
-                    result[idx * 2 + 1] = new_pos[1]
-                    mp = get_movable_polygon(mov, new_pos)
-                    if mp is not None:
-                        fb_placed_polys.append(mp.buffer(min_separation / 2))
-                        fb_placed_positions.append([new_pos[0], new_pos[1]])
-                        v = np.array(mov["verts"])
-                        fb_placed_max_radii.append(float(np.sqrt(v[:, 0] ** 2 + v[:, 1] ** 2).max()))
-                    spiral_count += 1
-                else:
-                    # Track as failed but STILL record polygon so subsequent
-                    # objects avoid this position.
-                    result[idx * 2] = target[0]
-                    result[idx * 2 + 1] = target[1]
-                    mp = get_movable_polygon(mov, target)
-                    if mp is not None:
-                        fb_placed_polys.append(mp.buffer(min_separation / 2))
-                        fb_placed_positions.append([float(target[0]), float(target[1])])
-                        v = np.array(mov["verts"])
-                        fb_placed_max_radii.append(float(np.sqrt(v[:, 0] ** 2 + v[:, 1] ** 2).max()))
-                    first_pass_failed.append((idx, mov))
-
-            # Retry failed objects with 2x search radius
-            if first_pass_failed:
-                retry_count = 0
-                for idx, mov in first_pass_failed:
-                    target = np.array(mov["target"])
-                    new_pos = find_nearest_valid_position(
-                        mov, target, obstacle_union,
-                        fb_placed_polys, fb_placed_positions, fb_placed_max_radii,
-                        region_poly, valid_slots, slot_tree,
-                        min_separation, max_search_radius * 2, search_step,
-                    )
-                    if new_pos is not None:
-                        result[idx * 2] = new_pos[0]
-                        result[idx * 2 + 1] = new_pos[1]
-                        mp = get_movable_polygon(mov, new_pos)
-                        if mp is not None:
-                            fb_placed_polys.append(mp.buffer(min_separation / 2))
-                            fb_placed_positions.append([new_pos[0], new_pos[1]])
-                            v = np.array(mov["verts"])
-                            fb_placed_max_radii.append(float(np.sqrt(v[:, 0] ** 2 + v[:, 1] ** 2).max()))
-                        retry_count += 1
-                    else:
-                        failed_placements.append(idx)
-                if retry_count > 0:
-                    print(f"    Retry pass: placed {retry_count}/{len(first_pass_failed)} previously-failed objects")
-
-            n_fallback = len(grid_failed)
-            print(f"    Grid-placed {grid_success}/{len(align_indices)} objects"
-                  + (f", {spiral_count}/{n_fallback} via spiral fallback" if n_fallback else ""))
-
-        else:
-            # Grid too small — fall back to spiral placement for all objects
-            print("    Table grid too small — falling back to spiral placement")
-            need_placement.sort(key=lambda im: (np.array(im[1]["verts"])[:, 0].ptp() * np.array(im[1]["verts"])[:, 1].ptp()), reverse=True)
-            for idx, mov in need_placement:
-                target = np.array(mov["target"])
-                new_pos = find_nearest_valid_position(
-                    mov, target, obstacle_union, placed_polys,
-                    placed_positions, placed_max_radii,
-                    region_poly, valid_slots, slot_tree,
-                    min_separation, max_search_radius, search_step,
-                )
-                if new_pos is None:
-                    result[idx * 2] = target[0]
-                    result[idx * 2 + 1] = target[1]
-                    failed_placements.append(idx)
-                    mov_poly = get_movable_polygon(mov, target)
-                    if mov_poly is not None:
-                        _record_placed(mov, target, mov_poly)
-                else:
-                    result[idx * 2] = new_pos[0]
-                    result[idx * 2 + 1] = new_pos[1]
-                    placed_poly = get_movable_polygon(mov, new_pos)
-                    if placed_poly is not None:
-                        _record_placed(mov, new_pos, placed_poly)
-
-    elif len(align_indices) == 1:
-        # Single object — just use its target (already validated or needs placement)
-        idx, mov = align_indices[0]
+    for idx, mov in movable_fixed_conflicts:
         target = np.array(mov["target"])
-        if (idx, mov) in need_placement:
-            new_pos = find_nearest_valid_position(
-                mov, target, obstacle_union, placed_polys,
-                placed_positions, placed_max_radii,
-                region_poly, valid_slots, slot_tree,
-                min_separation, max_search_radius, search_step,
-            )
-            if new_pos is not None:
-                result[idx * 2] = new_pos[0]
-                result[idx * 2 + 1] = new_pos[1]
-            else:
-                result[idx * 2] = target[0]
-                result[idx * 2 + 1] = target[1]
-                failed_placements.append(idx)
+        new_pos = find_nearest_valid_position(
+            mov, target, obstacle_union, placed_polys,
+            placed_positions, placed_max_radii,
+            region_poly, valid_slots, slot_tree,
+            min_separation, max_search_radius, search_step,
+        )
+        if new_pos is None:
+            still_need_placement.append((idx, mov))
+        else:
+            result[idx * 2] = new_pos[0]
+            result[idx * 2 + 1] = new_pos[1]
+            placed_poly = get_movable_polygon(mov, new_pos)
+            if placed_poly is not None:
+                _record_placed(mov, new_pos, placed_poly)
+
+    # PHASE 3: Place remaining objects (largest first — harder to fit).
+    still_need_placement.sort(key=_size_key, reverse=True)
+    for idx, mov in still_need_placement:
+        target = np.array(mov["target"])
+        new_pos = find_nearest_valid_position(
+            mov, target, obstacle_union, placed_polys,
+            placed_positions, placed_max_radii,
+            region_poly, valid_slots, slot_tree,
+            min_separation, max_search_radius, search_step,
+        )
+        if new_pos is None:
+            result[idx * 2] = target[0]
+            result[idx * 2 + 1] = target[1]
+            failed_placements.append(idx)
+            mov_poly = get_movable_polygon(mov, target)
+            if mov_poly is not None:
+                _record_placed(mov, target, mov_poly)
+        else:
+            result[idx * 2] = new_pos[0]
+            result[idx * 2 + 1] = new_pos[1]
+            placed_poly = get_movable_polygon(mov, new_pos)
+            if placed_poly is not None:
+                _record_placed(mov, new_pos, placed_poly)
 
     # Report displacement
     pts_initial = x0.reshape(-1, 2)
