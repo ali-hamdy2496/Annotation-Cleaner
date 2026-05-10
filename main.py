@@ -556,7 +556,7 @@ def main():
     np.random.seed(0)
 
     # ========== LOAD DATA ==========
-    json_path = "AnnotationCleaner_CurveLoops3.json"
+    json_path = "AnnotationCleaner_CurveLoops.json"
     print(f"Loading data from {json_path}...")
     movables, fixed_obstacles, placement_bounds = load_problem_data(json_path)
 

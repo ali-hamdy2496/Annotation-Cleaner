@@ -103,7 +103,7 @@ def get_movable_world_center(mov, position):
     """
     local_center = get_movable_local_center(mov)
     rotation = mov.get("RotationAngle", 0.0)
-    
+
     # Rotate local center
     if rotation != 0:
         cos_r = np.cos(rotation)
@@ -114,7 +114,7 @@ def get_movable_world_center(mov, position):
         ])
     else:
         rotated_center = local_center
-    
+
     return np.array(position) + rotated_center
 
 
@@ -132,7 +132,7 @@ def get_position_for_center(mov, desired_center):
     """
     local_center = get_movable_local_center(mov)
     rotation = mov.get("RotationAngle", 0.0)
-    
+
     # Rotate local center
     if rotation != 0:
         cos_r = np.cos(rotation)
@@ -143,7 +143,7 @@ def get_position_for_center(mov, desired_center):
         ])
     else:
         rotated_center = local_center
-    
+
     return np.array(desired_center) - rotated_center
 
 

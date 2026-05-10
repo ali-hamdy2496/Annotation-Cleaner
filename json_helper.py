@@ -45,7 +45,18 @@ def _parse_problem_data(data):
         origin_z = item["Origin"]["Z"]
         verts_absolute = np.array([[v["X"], v["Y"]] for v in item["Vertices"]])
         # verts_z = [v["Z"] for v in item["Vertices"]]
-        verts_local = verts_absolute - origin
+        # Absolute verts = rotate(local_verts, rotation) + origin.
+        # Undo both to recover true local verts so downstream
+        # translate_polygon(verts, pos, rotation) works correctly.
+        verts_translated = verts_absolute - origin
+        rotation = item["RotationAngle"]
+        if rotation != 0:
+            cos_r = np.cos(-rotation)
+            sin_r = np.sin(-rotation)
+            rot_inv = np.array([[cos_r, -sin_r], [sin_r, cos_r]])
+            verts_local = verts_translated @ rot_inv.T
+        else:
+            verts_local = verts_translated
 
         element = {
             "verts": verts_local,
@@ -142,7 +153,6 @@ def save_optimized_output(xvec, movables, overlapping_indices=None, output_path=
     for i, p in enumerate(pts):
         movable = movables[i]
 
-        # Convert local vertices to absolute coordinates using optimized position
         verts_absolute = translate_polygon(
             movable["verts"], p, movable["RotationAngle"]
         )
